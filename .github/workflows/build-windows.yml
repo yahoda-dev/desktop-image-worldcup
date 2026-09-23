@@ -1,0 +1,92 @@
+name: Build Windows executable
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Build Windows ${{ matrix.architecture }} exe
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86
+            bits: 32
+          - architecture: x64
+            bits: 64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version-file: ".python-version"
+          architecture: ${{ matrix.architecture }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.12.18"
+
+      - name: Verify Python architecture
+        shell: pwsh
+        run: |
+          python -c "import struct; actual = struct.calcsize('P') * 8; assert actual == ${{ matrix.bits }}, f'Expected ${{ matrix.bits }}-bit Python, got {actual}-bit'"
+
+      - name: Install locked dependencies
+        shell: pwsh
+        run: |
+          uv sync --locked --python "$env:pythonLocation\python.exe"
+          uv run --locked python -c "import struct; actual = struct.calcsize('P') * 8; assert actual == ${{ matrix.bits }}, f'Expected ${{ matrix.bits }}-bit project environment, got {actual}-bit'"
+
+      - name: Run tests
+        shell: pwsh
+        run: uv run --locked pytest
+
+      - name: Build executable
+        shell: pwsh
+        run: |
+          uv run --locked pyinstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --windowed `
+            --name "desktop-image-worldcup-${{ matrix.architecture }}" `
+            main.py
+
+      - name: Smoke test executable
+        shell: pwsh
+        run: |
+          $executable = "dist/desktop-image-worldcup-${{ matrix.architecture }}.exe"
+          if (-not (Test-Path $executable)) {
+            throw "Expected executable was not created: $executable"
+          }
+          $process = Start-Process `
+            -FilePath $executable `
+            -ArgumentList "--smoke-test" `
+            -Wait `
+            -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Executable smoke test failed with exit code $($process.ExitCode)"
+          }
+          Get-Item $executable | Format-List Name, Length, LastWriteTime
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-image-worldcup-windows-${{ matrix.architecture }}-${{ github.run_number }}
+          path: dist/desktop-image-worldcup-${{ matrix.architecture }}.exe
+          if-no-files-found: error
+          retention-days: 14
