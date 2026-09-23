@@ -90,3 +90,18 @@ def test_only_current_participant_can_win() -> None:
 
     with pytest.raises(ValueError):
         tournament.select(outsider)
+
+
+def test_history_records_match_round_number_and_winner() -> None:
+    tournament = Tournament(entries(4), 4, rng=random.Random(3))
+    first_match = tournament.current_match
+    assert first_match is not None
+
+    tournament.select(first_match.right)
+
+    assert len(tournament.history) == 1
+    result = tournament.history[0]
+    assert result.round_label == "4강"
+    assert result.match_number == 1
+    assert result.match == first_match
+    assert result.winner == first_match.right

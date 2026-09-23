@@ -42,13 +42,17 @@ Windows 종류는 **설정 → 시스템 → 정보 → 시스템 종류**에서
 - JPG/JPEG, PNG, WebP 지원
 - 손상되었거나 읽을 수 없는 이미지 자동 제외
 - 이미지 비율을 유지한 미리보기와 EXIF 회전 정보 적용
+- 이미지 검색 및 경기 이미지 로딩 중 진행 상태 표시
 - 유효 이미지 수 이하의 모든 짝수 라운드 지원
 - 선택한 라운드가 전체 이미지 수보다 작을 때 참가 이미지 무작위 추첨
 - 2의 거듭제곱이 아닌 라운드의 무작위 부전승 처리
 - 같은 라운드에서 동일한 이미지의 중복 출전 방지
 - 우승 이미지의 파일명과 전체 경로 표시
+- 화면 우측에서 라운드별 대진, 선택 결과, 현재 경기 확인
 - 같은 폴더 또는 새 폴더로 즉시 재시작
 - Windows x86·x64 실행 파일 제공
+- 실행 파일과 프로그램 창에 동일한 전용 아이콘 적용
+- 한글과 라틴 문자를 폭넓게 지원하는 Noto Sans KR 글꼴 사용
 
 ## 대진 구성 방식
 
@@ -97,7 +101,7 @@ uv run python main.py --smoke-test
 
 테스트에는 이미지 재귀 검색과 검증, 가능한 라운드 계산, 무작위 참가자 추첨, 예선·부전승, 전체 토너먼트 진행이 포함됩니다.
 
-## Windows 빌드
+## Windows 빌드와 릴리즈
 
 [Build Windows executable](https://github.com/yahoda-dev/desktop-image-worldcup/actions/workflows/build-windows.yml) 워크플로는 push 또는 수동 실행 시 다음 작업을 수행합니다.
 
@@ -107,7 +111,24 @@ uv run python main.py --smoke-test
 4. 생성된 실행 파일을 Windows에서 스모크 테스트합니다.
 5. 성공한 실행 파일을 14일 동안 Actions 아티팩트로 보관합니다.
 
-Actions 아티팩트는 배포 전 테스트 용도이며 다운로드하려면 GitHub 로그인이 필요합니다. 일반 사용자용 파일은 검증된 아티팩트를 [Releases](https://github.com/yahoda-dev/desktop-image-worldcup/releases)에 게시하세요.
+일반 브랜치 push와 수동 실행은 여기까지 진행합니다. Actions 아티팩트는 배포 전 테스트 용도이며 다운로드하려면 GitHub 로그인이 필요합니다.
+
+### 새 버전 배포
+
+`v`로 시작하는 버전 태그를 push하면 x86·x64 빌드가 모두 성공한 뒤 [GitHub Releases](https://github.com/yahoda-dev/desktop-image-worldcup/releases)에 자동으로 배포됩니다.
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+워크플로는 태그 이름으로 Release를 만들고 다음 파일을 첨부합니다.
+
+- `desktop-image-worldcup-x86.exe`
+- `desktop-image-worldcup-x64.exe`
+- `SHA256SUMS.txt`
+
+Release 설명은 이전 태그 이후의 변경 사항으로 자동 생성됩니다. 같은 태그의 워크플로를 다시 실행하면 기존 Release의 실행 파일과 체크섬을 새 빌드 결과로 교체합니다. 빌드나 테스트 중 하나라도 실패하면 Release는 생성·갱신되지 않습니다.
 
 ## 문제 제보
 
@@ -116,3 +137,5 @@ Actions 아티팩트는 배포 전 테스트 용도이며 다운로드하려면 
 ## 라이선스
 
 이 프로젝트는 [MIT License](LICENSE)로 배포됩니다.
+
+앱에 포함된 `Noto Sans KR` 글꼴은 [SIL Open Font License 1.1](assets/fonts/OFL.txt)로 배포됩니다. 앱 아이콘은 이 프로젝트를 위해 생성된 자산이며 프로젝트의 MIT License를 따릅니다.

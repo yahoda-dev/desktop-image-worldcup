@@ -63,6 +63,10 @@ jobs:
             --clean `
             --onefile `
             --windowed `
+            --icon "assets/icons/app-icon.ico" `
+            --add-data "assets/icons/app-icon.png:assets/icons" `
+            --add-data "assets/fonts/NotoSansKR[wght].ttf:assets/fonts" `
+            --add-data "assets/fonts/OFL.txt:assets/fonts" `
             --name "desktop-image-worldcup-${{ matrix.architecture }}" `
             main.py
 
@@ -90,3 +94,58 @@ jobs:
           path: dist/desktop-image-worldcup-${{ matrix.architecture }}.exe
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download x86 and x64 executables
+        uses: actions/download-artifact@v8
+        with:
+          pattern: desktop-image-worldcup-windows-*-${{ github.run_number }}
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f release-assets/desktop-image-worldcup-x86.exe
+          test -f release-assets/desktop-image-worldcup-x64.exe
+          cd release-assets
+          sha256sum \
+            desktop-image-worldcup-x86.exe \
+            desktop-image-worldcup-x64.exe \
+            > SHA256SUMS.txt
+          ls -lh
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          assets=(
+            "release-assets/desktop-image-worldcup-x86.exe#Windows 10 이상 32비트"
+            "release-assets/desktop-image-worldcup-x64.exe#Windows 10 이상 64비트"
+            "release-assets/SHA256SUMS.txt#SHA-256 체크섬"
+          )
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --verify-tag \
+              --generate-notes \
+              --title "Desktop Image World Cup $tag" \
+              --repo "$GITHUB_REPOSITORY"
+          fi

@@ -24,6 +24,14 @@ class Match:
         return self.left, self.right
 
 
+@dataclass(frozen=True, slots=True)
+class MatchResult:
+    round_label: str
+    match_number: int
+    match: Match
+    winner: ImageEntry
+
+
 def allowed_round_sizes(image_count: int) -> tuple[int, ...]:
     if image_count < 2:
         return ()
@@ -66,6 +74,7 @@ class Tournament:
         self._is_preliminary = False
         self._round_label = ""
         self._champion: ImageEntry | None = None
+        self._history: list[MatchResult] = []
 
         if self.preliminary_match_count:
             entrant_count = self.preliminary_match_count * 2
@@ -105,6 +114,10 @@ class Tournament:
     def is_finished(self) -> bool:
         return self._champion is not None
 
+    @property
+    def history(self) -> tuple[MatchResult, ...]:
+        return tuple(self._history)
+
     def select(self, winner: ImageEntry) -> None:
         match = self.current_match
         if match is None:
@@ -112,6 +125,9 @@ class Tournament:
         if winner not in match.participants:
             raise ValueError("현재 경기의 참가자만 선택할 수 있습니다.")
 
+        self._history.append(
+            MatchResult(self._round_label, self._match_index + 1, match, winner)
+        )
         self._round_winners.append(winner)
         self._match_index += 1
         if self._match_index < len(self._matches):
