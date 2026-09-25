@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+import os
 from pathlib import Path
 import queue
+import subprocess
+import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -10,8 +14,11 @@ from typing import Callable
 from PIL import Image, ImageTk
 
 from image_worldcup.scanner import (
+    ANIMATED_IMAGE_EXTENSIONS,
+    EXTERNAL_MEDIA_EXTENSIONS,
     ImageEntry,
     ScanResult,
+    load_animation_for_display,
     load_image_for_display,
     scan_images,
 )
@@ -19,7 +26,19 @@ from image_worldcup.resources import configure_fonts, set_window_icon
 from image_worldcup.tournament import Tournament, allowed_round_sizes
 
 
+@dataclass(frozen=True, slots=True)
+class MediaPreview:
+    frames: tuple[Image.Image, ...] = ()
+    durations: tuple[int, ...] = ()
+
+    @property
+    def is_animated(self) -> bool:
+        return len(self.frames) > 1
+
+
 class WorldCupApp:
+    EXTENSION_OPTIONS = ("jpg", "jpeg", "png", "webp", "gif", "mp4", "wav")
+
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self._font_family = configure_fonts(root)
@@ -36,30 +55,45 @@ class WorldCupApp:
         )
         self._image_token = 0
         self._image_queue: queue.Queue[
-            tuple[int, tuple[Image.Image, ...] | None, Exception | None]
+            tuple[int, tuple[MediaPreview, ...] | None, Exception | None]
         ] = queue.Queue()
         self._tournament: Tournament | None = None
-        self._current_images: tuple[Image.Image, ...] = ()
+        self._current_entries: tuple[ImageEntry, ...] = ()
+        self._current_media: tuple[MediaPreview, ...] = ()
         self._photo_images: list[ImageTk.PhotoImage | None] = [None, None]
         self._canvases: list[tk.Canvas] = []
+        self._animation_jobs: list[str | None] = []
+        self._animation_playing: list[bool] = []
+        self._animation_frame_indices: list[int] = []
         self._resize_job: str | None = None
         self._selection_locked = False
         self._choice_buttons: list[ttk.Button] = []
         self._loading_bar: ttk.Progressbar | None = None
+        self._extension_values = {
+            extension: True for extension in self.EXTENSION_OPTIONS
+        }
+        self._extension_vars: dict[str, tk.BooleanVar] = {}
 
         self._show_start_screen()
         self.root.after(100, self._poll_scan_queue)
 
     def _clear_root(self) -> None:
         self._image_token += 1
+        for job in self._animation_jobs:
+            if job is not None:
+                self.root.after_cancel(job)
         if self._resize_job is not None:
             self.root.after_cancel(self._resize_job)
             self._resize_job = None
         for child in self.root.winfo_children():
             child.destroy()
         self._canvases = []
-        self._current_images = ()
+        self._current_entries = ()
+        self._current_media = ()
         self._photo_images = [None, None]
+        self._animation_jobs = []
+        self._animation_playing = []
+        self._animation_frame_indices = []
         self._choice_buttons = []
         self._loading_bar = None
 
@@ -78,8 +112,26 @@ class WorldCupApp:
         ).pack(pady=(30, 12))
         ttk.Label(
             container,
-            text="JPG, PNG, WebP 이미지가 있는 폴더를 선택하세요.",
+            text="사용할 파일 형식을 고른 뒤 미디어가 있는 폴더를 선택하세요.",
         ).pack(pady=(0, 28))
+
+        extension_group = ttk.LabelFrame(container, text="사용할 확장자", padding=12)
+        extension_group.pack(fill="x", pady=(0, 14))
+        self._extension_vars = {}
+        for column, extension in enumerate(self.EXTENSION_OPTIONS):
+            variable = tk.BooleanVar(value=self._extension_values[extension])
+            self._extension_vars[extension] = variable
+            ttk.Checkbutton(
+                extension_group,
+                text=extension.upper(),
+                variable=variable,
+                command=self._extensions_changed,
+            ).grid(row=0, column=column, padx=8, sticky="w")
+            extension_group.columnconfigure(column, weight=1)
+        ttk.Label(
+            extension_group,
+            text="GIF·애니메이션 WebP는 화면에서, MP4·WAV는 기본 플레이어에서 재생됩니다.",
+        ).grid(row=1, column=0, columnspan=len(self.EXTENSION_OPTIONS), pady=(10, 0))
 
         folder_row = ttk.Frame(container)
         folder_row.pack(fill="x", pady=8)
@@ -122,27 +174,56 @@ class WorldCupApp:
             self._apply_scan_result(self._scan_result)
 
     def _choose_folder(self) -> None:
-        selected = filedialog.askdirectory(title="이미지 폴더 선택")
+        if not self._selected_extensions():
+            messagebox.showwarning("확장자 선택 필요", "확장자를 하나 이상 선택해 주세요.")
+            return
+        selected = filedialog.askdirectory(title="미디어 폴더 선택")
         if not selected:
             return
         self._selected_folder = Path(selected).resolve(strict=False)
         self._folder_var.set(str(self._selected_folder))
         self._begin_scan(self._selected_folder)
 
+    def _selected_extensions(self) -> frozenset[str]:
+        return frozenset(
+            f".{extension}"
+            for extension, variable in self._extension_vars.items()
+            if variable.get()
+        )
+
+    def _extensions_changed(self) -> None:
+        self._extension_values = {
+            extension: variable.get()
+            for extension, variable in self._extension_vars.items()
+        }
+        extensions = self._selected_extensions()
+        if not extensions:
+            self._scan_token += 1
+            self._scan_result = None
+            self._stop_scan_progress()
+            self._status_var.set("확장자를 하나 이상 선택해 주세요.")
+            self._round_var.set("")
+            self._round_combo.configure(values=(), state="disabled")
+            self._start_button.configure(state="disabled")
+            return
+        if self._selected_folder is not None:
+            self._begin_scan(self._selected_folder)
+
     def _begin_scan(self, folder: Path) -> None:
         self._scan_token += 1
         token = self._scan_token
         self._scan_result = None
-        self._status_var.set("이미지 파일을 검사하고 있습니다...")
+        self._status_var.set("미디어 파일을 검사하고 있습니다...")
         self._scan_progress.pack(pady=(0, 16), before=self._round_row)
         self._scan_progress.start(12)
         self._round_var.set("")
         self._round_combo.configure(values=(), state="disabled")
         self._start_button.configure(state="disabled")
+        extensions = self._selected_extensions()
 
         def worker() -> None:
             try:
-                result = scan_images(folder)
+                result = scan_images(folder, extensions)
                 self._scan_queue.put((token, result, None))
             except Exception as error:
                 self._scan_queue.put((token, None, error))
@@ -186,7 +267,7 @@ class WorldCupApp:
     def _apply_scan_result(self, result: ScanResult) -> None:
         self._stop_scan_progress()
         self._status_var.set(
-            f"사용 가능한 이미지 {result.valid_count}장 · 제외된 파일 {result.invalid_count}장"
+            f"사용 가능한 미디어 {result.valid_count}개 · 제외된 파일 {result.invalid_count}개"
         )
         sizes = allowed_round_sizes(result.valid_count)
         if not sizes:
@@ -194,8 +275,8 @@ class WorldCupApp:
             self._round_combo.configure(values=(), state="disabled")
             self._start_button.configure(state="disabled")
             messagebox.showwarning(
-                "이미지 부족",
-                "월드컵을 시작하려면 유효한 이미지가 2장 이상 필요합니다.",
+                "미디어 부족",
+                "월드컵을 시작하려면 유효한 미디어가 2개 이상 필요합니다.",
             )
             return
 
@@ -239,10 +320,14 @@ class WorldCupApp:
             ),
             font=(self._font_family, 18, "bold"),
         ).pack(pady=(0, 16))
+        ttk.Label(
+            game_area,
+            text="재생 형식은 화면을 클릭해 재생/일시정지하고, 아래 파일명 버튼으로 선택하세요.",
+        ).pack(pady=(0, 10))
 
         loading_row = ttk.Frame(game_area)
         loading_row.pack(fill="x", pady=(0, 10))
-        ttk.Label(loading_row, text="이미지를 불러오는 중입니다...").pack(side="left")
+        ttk.Label(loading_row, text="미디어를 불러오는 중입니다...").pack(side="left")
         self._loading_bar = ttk.Progressbar(loading_row, mode="indeterminate")
         self._loading_bar.pack(side="left", fill="x", expand=True, padx=(12, 0))
         self._loading_bar.start(10)
@@ -267,14 +352,16 @@ class WorldCupApp:
                 cursor="hand2",
             )
             canvas.grid(row=0, column=0, sticky="nsew")
-            canvas.bind("<Button-1>", self._selection_handler(entry))
+            if entry.is_playable:
+                canvas.bind("<Button-1>", self._playback_handler(index, entry))
+            else:
+                canvas.bind("<Button-1>", self._selection_handler(entry))
             canvas.bind("<Configure>", self._schedule_image_render)
+            loading_text = (
+                "재생 준비 중..." if entry.is_playable else "불러오는 중..."
+            )
             canvas.create_text(
-                20,
-                20,
-                text="불러오는 중...",
-                fill="#ffffff",
-                anchor="nw",
+                20, 20, text=loading_text, fill="#ffffff", anchor="nw",
                 font=(self._font_family, 12),
             )
             self._canvases.append(canvas)
@@ -294,18 +381,32 @@ class WorldCupApp:
     def _begin_image_load(self, entries: tuple[ImageEntry, ...]) -> None:
         self._image_token += 1
         token = self._image_token
+        self._current_entries = entries
 
         def worker() -> None:
             try:
-                images = tuple(load_image_for_display(entry.path) for entry in entries)
-                self._image_queue.put((token, images, None))
+                previews: list[MediaPreview] = []
+                for entry in entries:
+                    if entry.extension in EXTERNAL_MEDIA_EXTENSIONS:
+                        previews.append(MediaPreview())
+                    elif entry.extension in ANIMATED_IMAGE_EXTENSIONS:
+                        frames, durations = load_animation_for_display(entry.path)
+                        previews.append(MediaPreview(frames, durations))
+                    else:
+                        previews.append(
+                            MediaPreview((load_image_for_display(entry.path),), (100,))
+                        )
+                self._image_queue.put((token, tuple(previews), None))
             except Exception as error:
                 self._image_queue.put((token, None, error))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_image_load(self, images: tuple[Image.Image, ...]) -> None:
-        self._current_images = images
+    def _finish_image_load(self, previews: tuple[MediaPreview, ...]) -> None:
+        self._current_media = previews
+        self._animation_jobs = [None] * len(previews)
+        self._animation_playing = [False] * len(previews)
+        self._animation_frame_indices = [0] * len(previews)
         if self._loading_bar is not None:
             loading_row = self._loading_bar.master
             self._loading_bar.stop()
@@ -379,6 +480,63 @@ class WorldCupApp:
     def _selection_handler(self, entry: ImageEntry) -> Callable[[tk.Event], None]:
         return lambda _event: self._select_winner(entry)
 
+    def _playback_handler(
+        self, index: int, entry: ImageEntry
+    ) -> Callable[[tk.Event], None]:
+        return lambda _event: self._toggle_playback(index, entry)
+
+    def _toggle_playback(self, index: int, entry: ImageEntry) -> None:
+        if entry.opens_in_external_player:
+            self._open_in_default_player(entry.path)
+            return
+        if index >= len(self._current_media):
+            return
+        preview = self._current_media[index]
+        if not preview.is_animated:
+            self._select_winner(entry)
+            return
+        self._animation_playing[index] = not self._animation_playing[index]
+        if self._animation_playing[index]:
+            self._schedule_next_frame(index)
+        else:
+            job = self._animation_jobs[index]
+            if job is not None:
+                self.root.after_cancel(job)
+                self._animation_jobs[index] = None
+        self._render_media(index)
+
+    def _open_in_default_player(self, path: Path) -> None:
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except (OSError, subprocess.SubprocessError) as error:
+            messagebox.showerror("재생 실패", f"기본 플레이어를 열 수 없습니다.\n\n{error}")
+
+    def _schedule_next_frame(self, index: int) -> None:
+        if index >= len(self._current_media) or not self._animation_playing[index]:
+            return
+        preview = self._current_media[index]
+        frame_index = self._animation_frame_indices[index]
+        duration = preview.durations[frame_index]
+        self._animation_jobs[index] = self.root.after(
+            duration, lambda: self._advance_animation(index)
+        )
+
+    def _advance_animation(self, index: int) -> None:
+        if index >= len(self._current_media) or not self._animation_playing[index]:
+            return
+        preview = self._current_media[index]
+        self._animation_frame_indices[index] = (
+            self._animation_frame_indices[index] + 1
+        ) % len(preview.frames)
+        self._animation_jobs[index] = None
+        self._render_media(index)
+        self._schedule_next_frame(index)
+
     def _schedule_image_render(self, _event: tk.Event | None = None) -> None:
         if self._resize_job is not None:
             self.root.after_cancel(self._resize_job)
@@ -386,23 +544,55 @@ class WorldCupApp:
 
     def _render_images(self) -> None:
         self._resize_job = None
-        if len(self._canvases) != len(self._current_images):
+        if len(self._canvases) != len(self._current_media):
             return
-        for index, (canvas, source) in enumerate(
-            zip(self._canvases, self._current_images, strict=True)
-        ):
-            width = max(100, canvas.winfo_width() - 20)
-            height = max(100, canvas.winfo_height() - 20)
-            preview = source.copy()
-            preview.thumbnail((width, height), Image.Resampling.LANCZOS)
-            photo = ImageTk.PhotoImage(preview)
-            self._photo_images[index] = photo
-            canvas.delete("all")
-            canvas.create_image(
+        for index in range(len(self._current_media)):
+            self._render_media(index)
+
+    def _render_media(self, index: int) -> None:
+        if index >= len(self._canvases) or index >= len(self._current_media):
+            return
+        canvas = self._canvases[index]
+        preview = self._current_media[index]
+        entry = self._current_entries[index]
+        canvas.delete("all")
+
+        if not preview.frames:
+            media_name = "동영상" if entry.extension == ".mp4" else "오디오"
+            canvas.create_text(
                 canvas.winfo_width() // 2,
                 canvas.winfo_height() // 2,
-                image=photo,
+                text=f"▶ {media_name}\n\n클릭하면 기본 플레이어에서 재생됩니다.",
+                fill="#ffffff",
+                justify="center",
+                font=(self._font_family, 16, "bold"),
                 anchor="center",
+            )
+            return
+
+        frame_index = self._animation_frame_indices[index]
+        source = preview.frames[frame_index]
+        width = max(100, canvas.winfo_width() - 20)
+        height = max(100, canvas.winfo_height() - 20)
+        rendered = source.copy()
+        rendered.thumbnail((width, height), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(rendered)
+        self._photo_images[index] = photo
+        canvas.create_image(
+            canvas.winfo_width() // 2,
+            canvas.winfo_height() // 2,
+            image=photo,
+            anchor="center",
+        )
+        if preview.is_animated:
+            state = "Ⅱ 일시정지" if self._animation_playing[index] else "▶ 재생"
+            canvas.create_text(
+                16,
+                16,
+                text=state,
+                fill="#ffffff",
+                anchor="nw",
+                font=(self._font_family, 11, "bold"),
             )
 
     def _select_winner(self, winner: ImageEntry) -> None:
@@ -423,8 +613,8 @@ class WorldCupApp:
 
     def _abort_for_missing_image(self, error: Exception) -> None:
         messagebox.showerror(
-            "이미지를 읽을 수 없음",
-            "대회 진행 중 이미지가 삭제되었거나 읽을 수 없게 되었습니다.\n"
+            "미디어를 읽을 수 없음",
+            "대회 진행 중 미디어가 삭제되었거나 읽을 수 없게 되었습니다.\n"
             "폴더를 다시 검사합니다.\n\n"
             f"{error}",
         )
@@ -463,7 +653,7 @@ class WorldCupApp:
 
         loading_row = ttk.Frame(winner_area)
         loading_row.pack(fill="x", pady=(0, 10))
-        ttk.Label(loading_row, text="우승 이미지를 불러오는 중입니다...").pack(
+        ttk.Label(loading_row, text="우승 미디어를 불러오는 중입니다...").pack(
             side="left"
         )
         self._loading_bar = ttk.Progressbar(loading_row, mode="indeterminate")
@@ -475,9 +665,12 @@ class WorldCupApp:
             background="#202124",
             highlightthickness=0,
             height=420,
+            cursor="hand2" if champion.is_playable else "",
         )
         canvas.pack(fill="both", expand=True)
         canvas.bind("<Configure>", self._schedule_image_render)
+        if champion.is_playable:
+            canvas.bind("<Button-1>", self._playback_handler(0, champion))
         self._canvases = [canvas]
 
         path_var = tk.StringVar(value=str(champion.path))
